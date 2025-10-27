@@ -4,12 +4,32 @@ import axios from 'axios';
 // 定义 Augment 使用量信息接口
 interface AugmentUsageInfo {
   email: string;
+
+  // 新增: 计费模式标识
+  billingType: 'credits' | 'user-messages';
+
+  // 新增: 通用字段(兼容新旧)
+  totalAmount: number;      // 总额度(credits 或 messages)
+  usedAmount: number;       // 已用(credits 或 messages)
+  remainingAmount: number;  // 剩余(credits 或 messages)
+  unit: string;             // 单位名称 "Credits" 或 "User Messages"
+
+  // 保留旧字段(向下兼容)
   totalTokens: number;
   usedTokens: number;
   remainingTokens: number;
+
   registrationDate: string;
   expirationDate: string;
   dailyUsage?: { date: string, usage: number }[];
+
+  // 新增: 模型使用分布(仅 Credits 模式)
+  modelUsage?: {
+    sonnet?: number;
+    haiku?: number;
+    gpt5?: number;
+  };
+
   subscriptionInfo?: {
     id: string;
     name: string;
@@ -132,8 +152,11 @@ async function showAugmentUsage(context: vscode.ExtensionContext) {
     // 获取 Augment 使用量信息
     const usageInfo = await fetchAugmentUsage(token);
 
-    // 更新状态栏
-    statusBarItem.text = `$(pulse) Augment: ${usageInfo.remainingTokens}/${usageInfo.totalTokens}`;
+    // 更新状态栏 - 动态显示单位
+    const displayText = usageInfo.billingType === 'credits'
+      ? `$(pulse) Augment: ${usageInfo.remainingAmount.toLocaleString()}/${usageInfo.totalAmount.toLocaleString()} Credits`
+      : `$(pulse) Augment: ${usageInfo.remainingAmount}/${usageInfo.totalAmount} Messages`;
+    statusBarItem.text = displayText;
 
     // 创建 WebView 面板显示详细信息
     const panel = vscode.window.createWebviewPanel(
@@ -174,9 +197,24 @@ function viewUrlToApiUrl(token: string): string {
 // UTC转北京时间
 function utcToBeijing(utc: string): string {
   if (!utc) return "";
+
+  // 解析 UTC 时间
   const date = new Date(utc);
-  date.setHours(date.getHours() + 8);
-  return date.toISOString().replace("T", " ").slice(0, 19);
+
+  // 加上 8 小时的毫秒数 (北京时间 = UTC+8)
+  const offset = 8 * 60 * 60 * 1000;
+  const beijingTime = new Date(date.getTime() + offset);
+
+  // 手动格式化为 YYYY-MM-DD HH:mm:ss
+  // 使用 getUTC*() 方法获取已经加了 8 小时后的时间
+  const year = beijingTime.getUTCFullYear();
+  const month = String(beijingTime.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(beijingTime.getUTCDate()).padStart(2, '0');
+  const hour = String(beijingTime.getUTCHours()).padStart(2, '0');
+  const minute = String(beijingTime.getUTCMinutes()).padStart(2, '0');
+  const second = String(beijingTime.getUTCSeconds()).padStart(2, '0');
+
+  return `${year}-${month}-${day} ${hour}:${minute}:${second}`;
 }
 
 // 获取 Augment 使用量信息
@@ -196,14 +234,33 @@ async function fetchAugmentUsage(token: string): Promise<AugmentUsageInfo> {
 
     const info = subscriptionResponse.data.data[0];
     const email = info.customer?.name || '';
-    const regDate = utcToBeijing(info.start_date);
+    const regDate = utcToBeijing(info.creation_time);  // 使用 creation_time 而不是 start_date
     const expDate = utcToBeijing(info.end_date);
     const subscription_id = info.id;
 
+    // 调试日志: 打印所有 price_intervals
+    console.log('=== 调试信息: 所有 price_intervals ===');
+    console.log('订阅ID:', subscription_id);
+    console.log('price_intervals 数量:', info.price_intervals?.length || 0);
+    info.price_intervals?.forEach((p: any, index: number) => {
+      console.log(`\n--- Price Interval ${index + 1} ---`);
+      console.log('ID:', p.id);
+      console.log('Price ID:', p.price?.id);
+      console.log('Price Name:', p.price?.price?.name);
+      console.log('Pricing Unit:', p.allocation?.pricing_unit?.display_name);
+      console.log('Allocation Amount:', p.allocation?.amount);
+      console.log('Has Current Billing Period:', !!p.current_billing_period_start_date);
+      console.log('Start Date:', p.start_date);
+      console.log('End Date:', p.end_date);
+    });
+    console.log('=== 调试信息结束 ===\n');
+
     // 解析价格区间信息
     const priceIntervals: PriceInterval[] = [];
-    let currentUserMessagePriceId = '';
+    let currentPriceId = '';
     let currentAllocation = 0;
+    let billingType: 'credits' | 'user-messages' = 'user-messages'; // 默认旧模式
+    let unit = 'User Messages';
 
     // 找到当前活跃的计费周期
     const now = new Date();
@@ -237,17 +294,51 @@ async function fetchAugmentUsage(token: string): Promise<AugmentUsageInfo> {
           pricingUnit: priceInterval.allocation.pricing_unit?.display_name || ''
         };
 
-        // 如果是当前活跃的分配，记录总额度
-        if (priceInterval.current_billing_period_start_date &&
-            intervalInfo.allocation.pricingUnit.includes('User Messages')) {
-          currentAllocation = parseInt(priceInterval.allocation.amount.split('.')[0]);
+        // 检测计费模式并记录总额度
+        if (priceInterval.current_billing_period_start_date) {
+          const pricingUnit = intervalInfo.allocation.pricingUnit;
+
+          // 优先检测 Credits 模式
+          if (pricingUnit.includes('Credits') || pricingUnit.includes('credits')) {
+            billingType = 'credits';
+            unit = 'Credits';
+            currentAllocation = parseInt(priceInterval.allocation.amount.split('.')[0]);
+          }
+          // 向下兼容 User Messages 模式
+          else if (pricingUnit.includes('User Messages')) {
+            billingType = 'user-messages';
+            unit = 'User Messages';
+            currentAllocation = parseInt(priceInterval.allocation.amount.split('.')[0]);
+          }
         }
       }
 
-      // 找到当前活跃的 User Message 价格ID
-      if (priceInterval.current_billing_period_start_date &&
-          intervalInfo.name === 'User Message') {
-        currentUserMessagePriceId = priceInterval.price?.id || '';
+      // 找到当前活跃的价格ID (Credits 或 User Message)
+      if (priceInterval.current_billing_period_start_date) {
+        const priceName = intervalInfo.name;
+        const priceId = priceInterval.price?.id || '';
+
+        // 优先查找 "Augment Credits" (不是 "Included Allocation")
+        if (priceName === 'Augment Credits' && priceId) {
+          currentPriceId = priceId;
+          billingType = 'credits';
+          unit = 'Credits';
+          console.log('✓ 找到 Augment Credits 价格ID:', currentPriceId);
+        }
+        // 向下兼容其他 Credits 相关价格
+        else if (!currentPriceId && priceName.includes('Credit') && !priceName.includes('Included Allocation') && priceId) {
+          currentPriceId = priceId;
+          billingType = 'credits';
+          unit = 'Credits';
+          console.log('✓ 找到 Credits 价格ID:', currentPriceId);
+        }
+        // 向下兼容 User Message (包括 "User Message" 和 "Fractional Messages")
+        else if ((priceName === 'User Message' || priceName === 'Fractional Messages') && priceId && !currentPriceId) {
+          currentPriceId = priceId;
+          billingType = 'user-messages';
+          unit = 'User Messages';
+          console.log('✓ 找到 User Message 价格ID:', currentPriceId, '(', priceName, ')');
+        }
       }
 
       priceIntervals.push(intervalInfo);
@@ -255,29 +346,72 @@ async function fetchAugmentUsage(token: string): Promise<AugmentUsageInfo> {
 
     // 如果没有找到当前活跃的分配，使用最新的分配
     if (currentAllocation === 0) {
-      const latestAllocation = info.price_intervals
-        ?.filter((p: any) => p.allocation && p.price?.price?.name === "Included Allocation (User Messages)")
+      // 优先查找 Credits 分配
+      let latestAllocation = info.price_intervals
+        ?.filter((p: any) => p.allocation && (
+          p.price?.price?.name?.includes('Credits') ||
+          p.price?.price?.name?.includes('Included Allocation (Credits)')
+        ))
         ?.sort((a: any, b: any) => new Date(b.start_date).getTime() - new Date(a.start_date).getTime())[0];
 
       if (latestAllocation?.allocation?.amount) {
         currentAllocation = parseInt(latestAllocation.allocation.amount.split('.')[0]);
+        billingType = 'credits';
+        unit = 'Credits';
+      } else {
+        // 向下兼容: 查找 User Messages 分配
+        latestAllocation = info.price_intervals
+          ?.filter((p: any) => p.allocation && p.price?.price?.name === "Included Allocation (User Messages)")
+          ?.sort((a: any, b: any) => new Date(b.start_date).getTime() - new Date(a.start_date).getTime())[0];
+
+        if (latestAllocation?.allocation?.amount) {
+          currentAllocation = parseInt(latestAllocation.allocation.amount.split('.')[0]);
+          billingType = 'user-messages';
+          unit = 'User Messages';
+        }
       }
     }
 
     // 如果没有找到当前活跃的价格ID，使用最新的
-    if (!currentUserMessagePriceId) {
-      const latestUserMessage = info.price_intervals
-        ?.filter((p: any) => p.price?.price?.name === "User Message")
+    if (!currentPriceId) {
+      // 优先查找 "Augment Credits" 价格
+      let latestPrice = info.price_intervals
+        ?.filter((p: any) => p.price?.price?.name === "Augment Credits")
         ?.sort((a: any, b: any) => new Date(b.start_date).getTime() - new Date(a.start_date).getTime())[0];
 
-      currentUserMessagePriceId = latestUserMessage?.price?.id || '';
-    }
+      if (latestPrice?.price?.id) {
+        currentPriceId = latestPrice.price.id;
+        billingType = 'credits';
+        unit = 'Credits';
+      } else {
+        // 查找其他 Credits 相关价格(排除 Included Allocation)
+        latestPrice = info.price_intervals
+          ?.filter((p: any) => {
+            const name = p.price?.price?.name || '';
+            return name.includes('Credit') && !name.includes('Included Allocation');
+          })
+          ?.sort((a: any, b: any) => new Date(b.start_date).getTime() - new Date(a.start_date).getTime())[0];
 
-    const total = currentAllocation || 600; // 默认600
+        if (latestPrice?.price?.id) {
+          currentPriceId = latestPrice.price.id;
+          billingType = 'credits';
+          unit = 'Credits';
+        } else {
+          // 向下兼容: 查找 User Message 价格 (包括 "User Message" 和 "Fractional Messages")
+          latestPrice = info.price_intervals
+            ?.filter((p: any) => {
+              const name = p.price?.price?.name || '';
+              return name === "User Message" || name === "Fractional Messages";
+            })
+            ?.sort((a: any, b: any) => new Date(b.start_date).getTime() - new Date(a.start_date).getTime())[0];
 
-    // 2. 获取用量信息
-    if (!subscription_id || !currentUserMessagePriceId) {
-      throw new Error('未获取到订阅ID或价格ID');
+          if (latestPrice?.price?.id) {
+            currentPriceId = latestPrice.price.id;
+            billingType = 'user-messages';
+            unit = 'User Messages';
+          }
+        }
+      }
     }
 
     // 确保 token 不包含 URL 部分
@@ -289,7 +423,66 @@ async function fetchAugmentUsage(token: string): Promise<AugmentUsageInfo> {
       }
     }
 
-    const usageUrl = `https://portal.withorb.com/api/v1/subscriptions/${subscription_id}/usage?price_id=${currentUserMessagePriceId}&token=${cleanToken}`;
+    // 2. 获取 Customer 信息 (用于获取实际剩余额度)
+    // 注意: 只有新的 Credits 模式才有 ledger_pricing_units
+    // 老的 User Messages 模式没有此字段,需要使用 Allocation 方式
+    let creditsBalance = 0;
+    let customerId = '';
+    let pricingUnitId = '';
+
+    // 只有 Credits 模式才尝试获取 Ledger Summary
+    if (billingType === 'credits') {
+      try {
+        const customerUrl = `https://portal.withorb.com/api/v1/customer_from_link?token=${cleanToken}`;
+        const customerResponse = await axios.get(customerUrl, { headers });
+
+        customerId = customerResponse.data.customer?.id || '';
+        pricingUnitId = customerResponse.data.customer?.ledger_pricing_units?.[0]?.id || '';
+
+        console.log('✓ Customer ID:', customerId);
+        console.log('✓ Pricing Unit ID:', pricingUnitId);
+
+        // 3. 获取 Ledger Summary (实际剩余额度)
+        if (customerId && pricingUnitId) {
+          const ledgerUrl = `https://portal.withorb.com/api/v1/customers/${customerId}/ledger_summary?pricing_unit_id=${pricingUnitId}&token=${cleanToken}`;
+          const ledgerResponse = await axios.get(ledgerUrl, { headers });
+
+          // 解析剩余额度
+          const creditsBalanceStr = ledgerResponse.data.credits_balance;
+          if (creditsBalanceStr) {
+            creditsBalance = Math.floor(parseFloat(creditsBalanceStr));
+            console.log('✓ 剩余额度 (Ledger):', creditsBalance, unit);
+          }
+        } else {
+          console.warn('⚠️  Credits 模式但未找到 Pricing Unit ID,将使用 Allocation 方式');
+        }
+      } catch (error) {
+        console.warn('⚠️  获取 Ledger Summary 失败,将使用 Allocation 作为总额度:', error);
+        // 如果获取失败,继续使用 allocation 方式
+      }
+    } else {
+      console.log('ℹ️  User Messages 模式,跳过 Ledger API,使用 Allocation 方式');
+    }
+
+    // 调试日志: 打印最终检测结果
+    console.log('\n=== 最终检测结果 ===');
+    console.log('计费模式:', billingType);
+    console.log('单位:', unit);
+    console.log('Price ID:', currentPriceId);
+    console.log('Allocation 额度:', currentAllocation);
+    console.log('Ledger 剩余额度:', creditsBalance);
+    console.log('===================\n');
+
+    // 4. 获取用量信息
+    if (!subscription_id || !currentPriceId) {
+      console.error('错误: 未找到有效的 price_id');
+      console.error('Subscription ID:', subscription_id);
+      console.error('Current Price ID:', currentPriceId);
+      console.error('Billing Type:', billingType);
+      throw new Error(`未获取到订阅ID或价格ID (计费模式: ${billingType})`);
+    }
+
+    const usageUrl = `https://portal.withorb.com/api/v1/subscriptions/${subscription_id}/usage?price_id=${currentPriceId}&token=${cleanToken}`;
     const usageResponse = await axios.get(usageUrl, { headers });
 
     if (!usageResponse.data || !usageResponse.data.data_series) {
@@ -305,15 +498,36 @@ async function fetchAugmentUsage(token: string): Promise<AugmentUsageInfo> {
       const values = entry.values;
       let usage = 0;
 
-      if (values) {
-        usage = Object.values(values)[0] as number;
+      if (values && values[currentPriceId] !== undefined) {
+        usage = values[currentPriceId];
         used += usage;
       }
 
       dailyUsage.push({ date, usage });
     }
 
-    const remain = total - used;
+    // 计算总额度和剩余额度
+    let total: number;
+    let remain: number;
+
+    if (billingType === 'credits' && creditsBalance > 0) {
+      // Credits 模式 + 成功获取 Ledger Summary: 使用剩余额度计算总额度
+      remain = creditsBalance;
+      total = creditsBalance + used;
+      console.log('✓ 使用 Ledger 方式计算: 总额度 =', total, '(剩余', remain, '+ 已用', used, ')');
+    } else {
+      // User Messages 模式 或 Ledger API 失败: 使用 Allocation 方式
+      // 确保有有效的 allocation 值
+      if (!currentAllocation || currentAllocation === 0) {
+        // 如果没有找到 allocation,使用默认值
+        currentAllocation = billingType === 'credits' ? 4000 : 50;
+        console.warn('⚠️  未找到有效的 Allocation,使用默认值:', currentAllocation, unit);
+      }
+
+      total = currentAllocation;
+      remain = total - used;
+      console.log('✓ 使用 Allocation 方式计算: 总额度 =', total, '(分配', currentAllocation, '- 已用', used, ')');
+    }
 
     // 获取当前计费周期信息
     const currentBillingPeriod = activePriceIntervals.length > 0 ? {
@@ -324,12 +538,30 @@ async function fetchAugmentUsage(token: string): Promise<AugmentUsageInfo> {
     // 返回格式化的使用量信息
     return {
       email,
+
+      // 新增字段
+      billingType,
+      totalAmount: total,
+      usedAmount: used,
+      remainingAmount: remain,
+      unit,
+
+      // 保留旧字段(向下兼容)
       totalTokens: total,
       usedTokens: used,
       remainingTokens: remain,
+
       registrationDate: regDate,
       expirationDate: expDate,
       dailyUsage,
+
+      // TODO: 添加模型使用分布(需要额外 API 调用)
+      modelUsage: billingType === 'credits' ? {
+        sonnet: 0,
+        haiku: 0,
+        gpt5: 0
+      } : undefined,
+
       subscriptionInfo: {
         id: subscription_id,
         name: info.name || '',
@@ -385,6 +617,13 @@ function getWebviewContent(usageInfo: AugmentUsageInfo): string {
   } else {
     stepSize = 16;
   }
+
+  // 根据计费模式动态生成标题和单位
+  const isCreditsMode = usageInfo.billingType === 'credits';
+  const chartTitle = isCreditsMode
+    ? '当前账单周期用量（Credits）'
+    : '当前账单周期用量（User Message）';
+  const usageUnit = usageInfo.unit;
 
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -524,6 +763,10 @@ function getWebviewContent(usageInfo: AugmentUsageInfo): string {
         <td>${usageInfo.subscriptionInfo?.status || 'N/A'}</td>
       </tr>
       <tr>
+        <td>计费类型</td>
+        <td>${isCreditsMode ? '<strong style="color: #6366f1;">Credits 模式</strong>' : 'User Messages 模式'}</td>
+      </tr>
+      <tr>
         <td>计费模式</td>
         <td>${usageInfo.subscriptionInfo?.billingMode || 'N/A'}</td>
       </tr>
@@ -547,28 +790,28 @@ function getWebviewContent(usageInfo: AugmentUsageInfo): string {
       </tr>
       <tr>
         <td>总额度</td>
-        <td>${usageInfo.totalTokens}</td>
+        <td><strong>${usageInfo.totalAmount.toLocaleString()} ${usageUnit}</strong></td>
       </tr>
       <tr>
         <td>已用</td>
-        <td>${usageInfo.usedTokens}</td>
+        <td><strong style="color: #ef4444;">${usageInfo.usedAmount.toLocaleString()} ${usageUnit}</strong></td>
       </tr>
       <tr>
         <td>剩余</td>
-        <td>${usageInfo.remainingTokens}</td>
+        <td><strong style="color: #10b981;">${usageInfo.remainingAmount.toLocaleString()} ${usageUnit}</strong></td>
       </tr>
     </table>
 
     <div class="progress-container">
-      <div class="progress-bar" style="width: ${(usageInfo.usedTokens / usageInfo.totalTokens) * 100}%"></div>
+      <div class="progress-bar" style="width: ${(usageInfo.usedAmount / usageInfo.totalAmount) * 100}%"></div>
     </div>
 
     <div class="usage-text">
-      已使用 ${usageInfo.usedTokens} / ${usageInfo.totalTokens} (${((usageInfo.usedTokens / usageInfo.totalTokens) * 100).toFixed(2)}%)
+      已使用 ${usageInfo.usedAmount.toLocaleString()} / ${usageInfo.totalAmount.toLocaleString()} ${usageUnit} (${((usageInfo.usedAmount / usageInfo.totalAmount) * 100).toFixed(2)}%)
     </div>
 
     <div class="chart-section">
-      <div class="chart-title">当前账单周期用量（User Message）</div>
+      <div class="chart-title">${chartTitle}</div>
       <canvas id="chart"></canvas>
     </div>
 
