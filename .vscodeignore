@@ -1,0 +1,36 @@
+# Build files
+.vscode/**
+.vscode-test/**
+src/**
+.gitignore
+.yarnrc
+vsc-extension-quickstart.md
+**/tsconfig.json
+**/.eslintrc.json
+**/*.map
+**/*.ts
+
+# Development files
+webpack.config.js
+node_modules/**
+!node_modules/axios/**
+!node_modules/follow-redirects/**
+
+# Test files
+out/test/**
+
+# Temporary files
+tmp/**
+*.bak
+*.zip
+
+# Memory files
+.cunzhi-memory/**
+
+# Old versions
+*.vsix
+
+# Git files
+.git
+.gitignore
+
