@@ -67,6 +67,29 @@ interface PriceInterval {
 // 状态栏项
 let statusBarItem: vscode.StatusBarItem;
 
+// 自动刷新定时器
+let refreshTimer: NodeJS.Timeout | undefined;
+
+// 是否正在刷新（防止并发）
+let isRefreshing = false;
+
+// 缓存的使用量信息
+let cachedUsageInfo: AugmentUsageInfo | null = null;
+
+// 获取 Token（优先从配置读取，其次从 globalState 读取）
+function getToken(context: vscode.ExtensionContext): string | undefined {
+  // 优先从 workspace configuration 读取
+  const config = vscode.workspace.getConfiguration('augment-monitor');
+  const configToken = config.get<string>('token');
+
+  if (configToken && configToken.trim()) {
+    return configToken.trim();
+  }
+
+  // 如果配置中没有，从 globalState 读取（向后兼容）
+  return context.globalState.get<string>('augmentToken');
+}
+
 // 激活扩展
 export function activate(context: vscode.ExtensionContext) {
   console.log('Augment Monitor 扩展已激活');
@@ -87,19 +110,139 @@ export function activate(context: vscode.ExtensionContext) {
     await setAugmentToken(context);
   });
 
+  let openSettingsCommand = vscode.commands.registerCommand('augment-monitor.openSettings', () => {
+    // 打开设置页面并聚焦到 Augment Monitor 扩展的设置
+    vscode.commands.executeCommand('workbench.action.openSettings', '@ext:augment-code.augment-monitor');
+  });
+
   // 添加到订阅
   context.subscriptions.push(statusBarItem);
   context.subscriptions.push(showUsageCommand);
   context.subscriptions.push(setTokenCommand);
+  context.subscriptions.push(openSettingsCommand);
 
   // 检查是否已设置 token
-  const token = context.globalState.get<string>('augmentToken');
+  const token = getToken(context);
   if (!token) {
     vscode.window.showInformationMessage('请设置 Augment Token 以查看使用量', '设置 Token').then(selection => {
       if (selection === '设置 Token') {
         vscode.commands.executeCommand('augment-monitor.setToken');
       }
     });
+  } else {
+    // 启动时立即获取一次数据
+    updateUsageData(context);
+
+    // 启动自动刷新
+    startAutoRefresh(context);
+  }
+
+  // 监听配置变化
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration('augment-monitor.enableAutoRefresh') ||
+          e.affectsConfiguration('augment-monitor.refreshInterval')) {
+        stopAutoRefresh();
+        const token = getToken(context);
+        if (token) {
+          startAutoRefresh(context);
+        }
+      }
+
+      // 监听 token 配置变化
+      if (e.affectsConfiguration('augment-monitor.token')) {
+        const token = getToken(context);
+        if (token) {
+          // Token 已设置，立即刷新数据
+          updateUsageData(context);
+          // 重启自动刷新
+          stopAutoRefresh();
+          startAutoRefresh(context);
+        } else {
+          // Token 被清空，停止刷新
+          stopAutoRefresh();
+          statusBarItem.text = "$(pulse) Augment";
+          statusBarItem.backgroundColor = undefined;
+        }
+      }
+    })
+  );
+}
+
+// 启动自动刷新
+function startAutoRefresh(context: vscode.ExtensionContext) {
+  const config = vscode.workspace.getConfiguration('augment-monitor');
+  const enableAutoRefresh = config.get<boolean>('enableAutoRefresh', true);
+
+  if (!enableAutoRefresh) {
+    return;
+  }
+
+  const refreshInterval = Math.max(config.get<number>('refreshInterval', 300), 5);
+
+  refreshTimer = setInterval(() => {
+    updateUsageData(context);
+  }, refreshInterval * 1000);
+}
+
+// 停止自动刷新
+function stopAutoRefresh() {
+  if (refreshTimer) {
+    clearInterval(refreshTimer);
+    refreshTimer = undefined;
+  }
+}
+
+// 更新使用量数据（后台静默更新）
+async function updateUsageData(context: vscode.ExtensionContext) {
+  // 防止并发请求
+  if (isRefreshing) {
+    return;
+  }
+
+  const token = getToken(context);
+  if (!token) {
+    return;
+  }
+
+  isRefreshing = true;
+  try {
+    const usageInfo = await fetchAugmentUsage(token);
+    if (usageInfo) {
+      cachedUsageInfo = usageInfo;
+      updateStatusBar(usageInfo);
+    }
+  } catch (error) {
+    console.error('后台更新使用量失败:', error);
+  } finally {
+    isRefreshing = false;
+  }
+}
+
+// 更新状态栏显示
+function updateStatusBar(usageInfo: AugmentUsageInfo) {
+  const config = vscode.workspace.getConfiguration('augment-monitor');
+  const alertThreshold = config.get<number>('alertThreshold', 4000);
+
+  if (usageInfo.billingType === 'credits') {
+    const remaining = usageInfo.remainingAmount;
+    const total = usageInfo.totalAmount;
+
+    // 判断是否需要告警
+    if (remaining < alertThreshold) {
+      statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+      statusBarItem.text = `$(alert) Augment: ${remaining.toLocaleString()}/${total.toLocaleString()} Credits ⚠️`;
+      statusBarItem.tooltip = `⚠️ Credits 余额不足！剩余 ${remaining.toLocaleString()} Credits`;
+    } else {
+      statusBarItem.backgroundColor = undefined;
+      statusBarItem.text = `$(pulse) Augment: ${remaining.toLocaleString()}/${total.toLocaleString()} Credits`;
+      statusBarItem.tooltip = `查看 Augment 使用量\n剩余 ${remaining.toLocaleString()} Credits`;
+    }
+  } else {
+    // User Messages 模式不需要告警
+    statusBarItem.backgroundColor = undefined;
+    statusBarItem.text = `$(pulse) Augment: ${usageInfo.remainingAmount}/${usageInfo.totalAmount} Messages`;
+    statusBarItem.tooltip = `查看 Augment 使用量\n剩余 ${usageInfo.remainingAmount} Messages`;
   }
 }
 
@@ -124,8 +267,13 @@ async function setAugmentToken(context: vscode.ExtensionContext) {
     }
   }
 
-  // 保存 token
+  // 保存 token 到配置（推荐方式）
+  const config = vscode.workspace.getConfiguration('augment-monitor');
+  await config.update('token', token, vscode.ConfigurationTarget.Global);
+
+  // 同时保存到 globalState（向后兼容）
   await context.globalState.update('augmentToken', token);
+
   vscode.window.showInformationMessage('Augment Token 已保存');
 
   // 立即显示使用量
@@ -134,7 +282,7 @@ async function setAugmentToken(context: vscode.ExtensionContext) {
 
 // 显示 Augment 使用量
 async function showAugmentUsage(context: vscode.ExtensionContext) {
-  const token = context.globalState.get<string>('augmentToken');
+  const token = getToken(context);
 
   if (!token) {
     vscode.window.showWarningMessage('请先设置 Augment Token', '设置 Token').then(selection => {
@@ -510,7 +658,7 @@ async function fetchAugmentUsage(token: string): Promise<AugmentUsageInfo> {
     let total: number;
     let remain: number;
 
-    if (billingType === 'credits' && creditsBalance > 0) {
+    if (billingType === 'credits' && creditsBalance >= 0) {
       // Credits 模式 + 成功获取 Ledger Summary: 使用剩余额度计算总额度
       remain = creditsBalance;
       total = creditsBalance + used;
@@ -921,6 +1069,7 @@ function getWebviewContent(usageInfo: AugmentUsageInfo): string {
 
 // 停用扩展
 export function deactivate() {
+  stopAutoRefresh();
   if (statusBarItem) {
     statusBarItem.dispose();
   }
