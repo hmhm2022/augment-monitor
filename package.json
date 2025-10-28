@@ -2,7 +2,7 @@
   "name": "augment-monitor",
   "displayName": "Augment Monitor",
   "description": "Monitor your Augment usage and subscription status",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "augment-code",
   "repository": {
     "type": "git",
