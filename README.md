@@ -69,7 +69,7 @@
 
 ## 配置选项
 
-通过命令面板（Ctrl+Shift+P 或 Cmd+Shift+P）执行 "Set Augment Token" 命令，或在 VS Code 设置中搜索 "Augment Monitor"  可以配置以下选项：
+通过命令面板（Ctrl+Shift+P 或 Cmd+Shift+P）执行 "Augment Monitor Settings" 命令，或在 VS Code 设置中搜索 "Augment Monitor"  可以配置以下选项：
 
 - **启用自动刷新** (`augment-monitor.enableAutoRefresh`)
   - 默认：启用
